@@ -1,0 +1,27 @@
+package config
+
+import "github.com/ride-hailing/shared/pkg/env"
+
+type Config struct {
+	Port           string
+	DatabaseURL    string
+	RedisAddr      string
+	RedisPassword  string
+	KafkaBrokers   []string
+	JWTSecret      string
+	AdminToken     string
+	InternalSecret string
+}
+
+func Load() Config {
+	return Config{
+		Port:           env.Get("PORT", "8081"),
+		DatabaseURL:    env.MustGet("USER_DB_URL"),
+		RedisAddr:      env.Get("REDIS_ADDR", "redis:6379"),
+		RedisPassword:  env.Get("REDIS_PASSWORD", ""),
+		KafkaBrokers:   []string{env.Get("KAFKA_BROKERS", "kafka:9092")},
+		JWTSecret:      env.MustGet("JWT_SECRET"),
+		AdminToken:     env.Get("ADMIN_TOKEN", ""),
+		InternalSecret: env.MustGet("INTERNAL_SECRET"),
+	}
+}

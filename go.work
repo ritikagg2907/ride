@@ -1,0 +1,13 @@
+go 1.22
+
+use (
+	./shared
+	./services/user-service
+	./services/driver-service
+	./services/trip-service
+	./services/matching-service
+	./services/surge-pricing-service
+	./services/payment-service
+	./services/notification-service
+	./services/admin-service
+)

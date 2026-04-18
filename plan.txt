@@ -1,0 +1,463 @@
+================================================================================
+  MULTI-REGION RIDE-HAILING PLATFORM — IMPLEMENTATION PLAN
+  Language: Go 1.22 | Infra: Docker, Kafka (KRaft), Redis 7, Postgres 15
+  Architecture: Microservices — Go Workspace (monorepo)
+  Reference: github.com/SaiKrishnaMulukutla/uber (architecture reference only)
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 0 — HIGH-LEVEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Services:
+  1. api-gateway          NGINX reverse proxy — rate limit, JWT passthrough, routing
+  2. user-service         Rider auth (register, OTP login, JWT, profile)
+  3. driver-service       Driver auth, GPS location (Redis GEO), status
+  4. trip-service         Lifecycle: REQUESTED→STARTED→COMPLETED, fare, ratings, WebSocket
+  5. matching-service     Kafka consumer — geo-match, Redlock, reassign on decline
+  6. surge-pricing-svc    Dedicated surge: H3 geo-cells, supply/demand → Redis cache
+  7. payment-service      PSP (Razorpay/cash/UPI), circuit breaker, reconciliation
+  8. notification-svc     Kafka fan-out → email (Brevo/SMTP) + in-app
+  9. admin-service        Feature flags, kill-switches, DLQ replay, health rollup
+
+Data Stores:
+  Redis    — driver geo-index (GEORADIUS), surge cache, OTP, idempotency keys,
+             session tokens, Redlock (dispatch), notification dedup
+  Kafka    — all async event flows (KRaft mode, no Zookeeper)
+  Postgres — one DB per service (per-service isolation)
+
+Kafka Topics (UPPER_SNAKE_CASE):
+  RIDE_REQUESTED          rider request published by trip-service
+  RIDE_OFFERED            driver offer published by matching-service
+  RIDE_CANCELLED          cancellation by rider/driver
+  DRIVER_ASSIGNED         matching confirmed, consumed by trip + notification
+  TRIP_STARTED            trip lifecycle event
+  TRIP_COMPLETED          triggers payment + notification
+  TRIP_CANCELLED          triggers refund + notification
+  RATING_SUBMITTED        triggers user/driver score update
+  PAYMENT_COMPLETED       triggers notification + driver earnings record
+  PAYMENT_FAILED          triggers retry logic + rider notification
+  SURGE_RECOMPUTE         periodic/supply-change trigger for surge-svc
+  ADMIN_FLAG_CHANGED      feature flag broadcast to all services
+  *.DLQ                   dead-letter suffix for every consumer group
+
+Directory Layout:
+  ride-hailing/
+  ├── go.work
+  ├── Makefile
+  ├── infra/
+  │   ├── docker-compose.yml
+  │   ├── nginx.conf
+  │   ├── nginx.Dockerfile
+  │   └── .env.example
+  ├── shared/
+  │   └── pkg/
+  │       ├── db/          pgxpool, migrations runner
+  │       ├── env/         typed env helpers
+  │       ├── jwt/         issue + validate tokens
+  │       ├── kafka/       producer, consumer, DLQ, event structs
+  │       ├── redis/       geo, KV, Redlock, OTP helpers
+  │       ├── mailer/      SMTP + Brevo
+  │       ├── otp/         6-digit OTP gen + verify
+  │       └── middleware/  idempotency, logging, Prometheus
+  └── services/
+      ├── user-service/
+      ├── driver-service/
+      ├── trip-service/
+      ├── matching-service/
+      ├── surge-pricing-service/
+      ├── payment-service/
+      ├── notification-service/
+      └── admin-service/
+
+Each service follows:
+  cmd/main.go → config/config.go → internal/{model,repository,service,controller}/
+  migrations/  → Flyway-style V1_*.sql embedded via go:embed
+  Dockerfile
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 1 — SCAFFOLD & SHARED PACKAGES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[ ] 1.1  go.work covering shared/ + all 8 services
+[ ] 1.2  Makefile: build-all, test-all, up, down, migrate-all, lint
+[ ] 1.3  shared/pkg/env/ — typed helpers: MustGet, GetWithDefault
+[ ] 1.4  shared/pkg/db/  — pgxpool connect (retry on startup), RunMigrations()
+[ ] 1.5  shared/pkg/redis/ — NewClient, GeoAdd, GeoRadius, SetNX (TTL),
+         Get/Set/Del, Redlock (acquire/release), PubSub wrappers
+[ ] 1.6  shared/pkg/kafka/
+         - events.go: all event structs with JSON tags (using UPPER_SNAKE_CASE consts)
+         - producer.go: sync + async, DLQ fallback on exhausted retries
+         - consumer.go: consumer-group loop, at-least-once, manual offset commit
+[ ] 1.7  shared/pkg/jwt/ — Issue(userID, role, region) → signed token,
+         Validate(token) → Claims; HMAC-SHA256, 15min access / 7d refresh
+[ ] 1.8  shared/pkg/otp/ — Generate() 6-digit, Store in Redis (TTL 10min),
+         Verify(code) bool
+[ ] 1.9  shared/pkg/mailer/ — Send(to, subject, html) via Brevo API,
+         fallback to SMTP (Gmail); configurable via env
+[ ] 1.10 shared/pkg/middleware/ — RequestLogger (zerolog), PrometheusMetrics
+         (latency histogram per route+method), IdempotencyKey (Redis SetNX)
+[ ] 1.11 infra/.env.example with all required env vars documented
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 2 — SERVICE: USER-SERVICE  (port 8081)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DB: users_db
+Schema: users(id UUID PK, name, email UNIQUE, phone UNIQUE, password_hash,
+              rating FLOAT DEFAULT 5.0, rating_count INT DEFAULT 0, created_at)
+
+[ ] 2.1  POST /users/register   — bcrypt hash, INSERT user
+[ ] 2.2  POST /users/login      — verify password → generate OTP → email OTP
+[ ] 2.3  POST /users/verify-login — verify OTP → return access+refresh JWT
+[ ] 2.4  POST /users/refresh    — validate refresh token → new access token
+[ ] 2.5  GET  /users/{id}       — JWT-gated, only own profile
+[ ] 2.6  Kafka consumer RATING_SUBMITTED → UPDATE users SET rating, rating_count
+[ ] 2.7  GET /health/ready      — checks DB + Redis connectivity
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 3 — SERVICE: DRIVER-SERVICE  (port 8082)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DB: drivers_db
+Schema: drivers(id UUID PK, name, email UNIQUE, phone UNIQUE, password_hash,
+                vehicle_type VARCHAR DEFAULT 'sedan', license_plate,
+                status VARCHAR DEFAULT 'available',   -- available|busy|offline
+                rating FLOAT DEFAULT 5.0, rating_count INT, created_at)
+Redis keys:
+  drivers:geo            — GEOADD set for GEORADIUS queries
+  driver:{id}:meta       — HSET: status, lat, lng, vehicle_type, updated_at
+
+[ ] 3.1  POST /drivers/register
+[ ] 3.2  POST /drivers/login        → OTP email
+[ ] 3.3  POST /drivers/verify-login → JWT
+[ ] 3.4  POST /drivers/refresh
+[ ] 3.5  GET  /drivers/{id}
+[ ] 3.6  PATCH /drivers/{id}/location  — GEOADD + HSET in Redis; idempotent on
+          timestamp (skip if same ts seen in last 2s via SetNX)
+[ ] 3.7  PATCH /drivers/{id}/status   — update Redis meta + Postgres
+[ ] 3.8  GET  /drivers/nearby          — GEORADIUS 5km, vehicle_type filter
+[ ] 3.9  POST /drivers/trips/{tripId}/respond  — ACCEPT|DECLINE (consumed by matching)
+         publishes to Kafka (matching-service listens on RIDE_OFFERED responses)
+[ ] 3.10 Background goroutine: every 30s mark drivers offline if
+          updated_at > 60s → ZREM from geo set
+[ ] 3.11 Kafka consumer RATING_SUBMITTED (rater_role=rider) → UPDATE driver rating
+[ ] 3.12 GET /health/ready
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 4 — SERVICE: TRIP-SERVICE  (port 8083)  [LLD DEEP-DIVE]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DB: trips_db
+Migrations:
+  V1: trips(id UUID PK, rider_id, driver_id, rider_email, rider_phone,
+            pickup_lat, pickup_lng, drop_lat, drop_lng, fare DECIMAL,
+            status VARCHAR,   -- REQUESTED|STARTED|COMPLETED|CANCELLED
+            payment_method VARCHAR, duration_seconds INT,
+            requested_at, started_at, completed_at, created_at)
+  V2: ratings(trip_id, rater_id, rater_role, ratee_id, ratee_role,
+              score INT, comment TEXT, created_at)
+  V3: ALTER TABLE trips ADD COLUMN vehicle_type VARCHAR
+
+[ ] 4.1  POST /trips/estimate   — fare preview (haversine distance × rate × surge)
+[ ] 4.2  POST /trips/request    — INSERT trip (status=REQUESTED), publish RIDE_REQUESTED
+         idempotency: X-Idempotency-Key → Redis SetNX, return cached on duplicate
+[ ] 4.3  GET  /trips/{id}
+[ ] 4.4  PATCH /trips/{id}/assign    — internal (X-Internal-Secret header),
+          UPDATE driver_id + status=STARTED; called by matching-service
+[ ] 4.5  PATCH /trips/{id}/start     — driver starts trip (status=STARTED)
+[ ] 4.6  PATCH /trips/{id}/end       — driver ends trip; compute fare, duration;
+          publish TRIP_COMPLETED → triggers payment + notification
+[ ] 4.7  PATCH /trips/{id}/cancel    — publish TRIP_CANCELLED
+[ ] 4.8  POST  /trips/{id}/rate      — INSERT rating, publish RATING_SUBMITTED
+[ ] 4.9  GET   /trips/history        — paginated (limit, offset) by rider or driver
+[ ] 4.10 GET   /trips/surge          — read from Redis surge:multiplier (set by surge-svc)
+[ ] 4.11 PATCH /trips/surge          — admin override: write to Redis directly
+[ ] 4.12 WebSocket /ws/{tripId}      — driver pushes lat/lng; broadcast to rider
+          (gorilla/websocket hub per trip, goroutine per conn)
+[ ] 4.13 GET /health/ready
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 5 — SERVICE: MATCHING-SERVICE  (port 8087, background only)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+No HTTP — pure Kafka consumer + Redis.
+
+[ ] 5.1  Kafka consumer on RIDE_REQUESTED:
+         a. GEORADIUS drivers:geo → up to 20 nearest available drivers (5km radius)
+            filter by vehicle_type match
+         b. Score candidates: score = 0.6*(1/dist_km) + 0.3*rating + 0.1*acceptance_rate
+         c. Take top-5; acquire Redlock per driver (TTL 15s, prevent double-assign)
+         d. Publish RIDE_OFFERED to that driver; Redis key offer:{ride}:{driver}=pending TTL=30s
+         e. Wait for driver response (poll Redis key); timeout = 30s
+         f. On ACCEPT → call trip-service PATCH /trips/{id}/assign (internal),
+            publish DRIVER_ASSIGNED, release locks on other candidates
+         g. On DECLINE/timeout → release lock, try next candidate
+         h. After 10 min of retries or radius expanded to 10km still no match →
+            PATCH trip status=CANCELLED, publish RIDE_CANCELLED
+[ ] 5.2  Redis pub/sub channel driver:response:{ride_id} for real-time driver ack
+[ ] 5.3  Prometheus: dispatch_latency_seconds histogram (p95 target ≤ 1s),
+         dispatch_success_total, dispatch_no_driver_total
+[ ] 5.4  GET /health/ready (minimal HTTP server just for health check)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 6 — SERVICE: SURGE-PRICING-SERVICE  (port 8084)  [NEW — not in ref repo]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Purpose: Dedicated surge micro-service. Trip-service reads from Redis only.
+Uses H3 hex-cell indexing (resolution 7, ~5km²) for geo-cell granularity.
+
+Redis keys:
+  surge:cell:{h3_index}       multiplier FLOAT, TTL 90s
+  surge:demand:{h3_index}     INCR counter, TTL 60s (sliding window)
+  surge:override:{h3_index}   admin override, TTL variable
+
+[ ] 6.1  Kafka consumer RIDE_REQUESTED → INCR surge:demand:{cell} (60s TTL)
+[ ] 6.2  Kafka consumer SURGE_RECOMPUTE → for each cell in payload:
+         supply  = GEORADIUS count of available drivers in cell
+         demand  = GET surge:demand:{cell}
+         ratio   = demand / max(supply, 1)
+         mult    = clamp(1.0 + (ratio-1)*0.5, 1.0, 5.0)
+         check   surge:override:{cell} → use override if present
+         SET surge:cell:{cell} mult EX 90
+[ ] 6.3  Background ticker every 30s → publish SURGE_RECOMPUTE for all active cells
+[ ] 6.4  GET /surge/{h3_cell}                — read from Redis, fallback 1.0
+[ ] 6.5  POST /surge/{h3_cell}/override      — admin: set override multiplier + TTL
+         (requires X-Admin-Token header)
+[ ] 6.6  GET /surge/map                      — return all active cell multipliers
+         (reads all keys surge:cell:* from Redis SCAN)
+[ ] 6.7  Prometheus: surge_multiplier gauge (per cell), recompute_duration histogram
+[ ] 6.8  GET /health/ready
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 7 — SERVICE: PAYMENT-SERVICE  (port 8085)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DB: payments_db
+Schema: payments(id UUID PK DEFAULT gen_random_uuid(),
+  trip_id UUID UNIQUE, rider_id, rider_email, rider_phone, driver_id,
+  amount DECIMAL(12,2), status VARCHAR DEFAULT 'PENDING',
+  payment_method VARCHAR, provider VARCHAR DEFAULT 'cash',
+  provider_order_id, provider_payment_id, provider_signature,
+  failure_reason TEXT, metadata JSONB DEFAULT '{}',
+  attempts_count INT DEFAULT 0, created_at, completed_at, updated_at)
+
+Providers: cash | razorpay (card + UPI)
+Circuit breaker (gobreaker): open after 5 failures, half-open after 30s
+
+[ ] 7.1  Kafka consumer TRIP_COMPLETED → INSERT payment (status=PENDING)
+[ ] 7.2  Async charge flow (goroutine after insert):
+         - cash: status=AWAITING_CASH_CONFIRM
+         - razorpay: create Razorpay order → return checkout URL
+         on circuit breaker OPEN → status=FAILED, publish PAYMENT_FAILED
+[ ] 7.3  POST /payments/orders           — create Razorpay order
+[ ] 7.4  POST /payments/verify           — verify Razorpay webhook signature
+[ ] 7.5  GET  /payments/checkout/{id}    — serve HTML checkout page
+[ ] 7.6  POST /payments/{id}/confirm-cash — driver confirms cash collected
+[ ] 7.7  POST /payments/simulate-success — dev/test endpoint
+[ ] 7.8  GET  /payments/{id}             — payment details
+[ ] 7.9  GET  /payments/history          — paginated, rider_id from JWT
+[ ] 7.10 GET  /payments/earnings         — driver earnings by period (today/week/month)
+[ ] 7.11 WebSocket /payments/ws/         — real-time payment status updates
+[ ] 7.12 Retry: on PAYMENT_FAILED event → exponential backoff 2^n*1s, max 5 attempts
+[ ] 7.13 Reconciliation job every 6h: query stale PROCESSING payments, sync PSP state
+[ ] 7.14 On success: publish PAYMENT_COMPLETED
+[ ] 7.15 PCI: never log card numbers; store PSP tokens only
+[ ] 7.16 GET /health/ready
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 8 — SERVICE: NOTIFICATION-SERVICE  (port 8086)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DB: notifications_db
+Schema: notifications(id UUID PK, user_id UUID, type VARCHAR,
+  title VARCHAR, body TEXT, read BOOL DEFAULT false, created_at)
+
+[ ] 8.1  Kafka consumers:
+         DRIVER_ASSIGNED  → rider: "Driver on the way (ETA Xs)"
+         TRIP_STARTED     → rider: "Your trip has started"
+         TRIP_COMPLETED   → rider: "Trip ended. Fare: $Y"
+         TRIP_CANCELLED   → both: "Trip cancelled"
+         PAYMENT_COMPLETED → rider: "Payment confirmed $Y"
+         PAYMENT_FAILED   → rider: "Payment failed, please retry"
+[ ] 8.2  Dedup via Redis: notif:{user_id}:{type}:{ref_id} SetNX TTL 5min
+[ ] 8.3  Email channel: Brevo API primary, SMTP fallback; retry ×3
+[ ] 8.4  In-app: INSERT to notifications table
+[ ] 8.5  GET /notifications   — paginated (limit, offset), user from JWT
+[ ] 8.6  PATCH /notifications/{id}/read — mark as read
+[ ] 8.7  GET /health/ready
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 9 — SERVICE: ADMIN-SERVICE  (port 8088)  [NEW — not in ref repo]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DB: admin_db
+Schema: feature_flags(id UUID PK, name TEXT UNIQUE, enabled BOOL,
+  rollout_pct INT DEFAULT 100, regions TEXT[], description TEXT,
+  updated_by TEXT, updated_at TIMESTAMPTZ)
+
+All endpoints require X-Admin-Token header.
+
+[ ] 9.1  GET    /admin/flags          — list all flags
+[ ] 9.2  POST   /admin/flags          — upsert flag (INSERT ON CONFLICT UPDATE)
+[ ] 9.3  DELETE /admin/flags/{name}   — delete flag
+[ ] 9.4  POST   /admin/flags/{name}/kill — force enabled=false (kill-switch)
+[ ] 9.5  On any flag change:
+         - Write to Redis: flag:{name} JSON TTL 5min
+         - Publish ADMIN_FLAG_CHANGED to Kafka
+         All services consume and update local in-memory map (checked on each request)
+[ ] 9.6  Kill-switch checks (all services read Redis flag:{name}):
+         dispatch.enabled = false   → matching-svc returns CANCELLED immediately
+         payments.enabled = false   → payment-svc skips PSP, queues for later
+         surge.enabled    = false   → surge-svc returns 1.0 everywhere
+[ ] 9.7  GET /admin/health/all — fan-out to /health/ready of all 7 services,
+         aggregate { service, status, latency_ms }[]
+[ ] 9.8  POST /admin/dlq/{topic}/replay — re-publish all messages from *.DLQ topic
+         back to the original topic; used by ops for poison-message recovery
+[ ] 9.9  GET /health/ready
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 10 — BONUS FEATURE: DRIVER EARNINGS DASHBOARD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Extends payment-service (no new service needed).
+DB addition: earnings view / table in payments_db already via /payments/earnings.
+
+[ ] 10.1 GET /payments/earnings?period=today|week|month
+          — SUM(net), COUNT(trips), AVG(fare), filtered by driver_id from JWT
+[ ] 10.2 WebSocket /payments/ws/earnings — push update after each PAYMENT_COMPLETED
+          event matching driver_id; uses existing WS hub in payment-service
+[ ] 10.3 GET /payments/recommendations
+          — top 3 H3 cells where driver earns most (last 7d) correlated with
+            current surge:cell:* Redis scan; helps driver choose where to go
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 11 — RESILIENCE PLAN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[ ] 11.1 Idempotency: X-Idempotency-Key on all mutation APIs; Redis SetNX stores
+         key→response (TTL 24h); DB UNIQUE constraint as second guard
+
+[ ] 11.2 Retries + jitter: PSP 2^n*1s ±20%, max 5 attempts, max delay 60s;
+         Kafka producer retries=3 with 100ms base; consumer at-least-once
+
+[ ] 11.3 Circuit breakers (gobreaker on PSP): open after 5 failures, half-open 30s;
+         surge fallback: breaker OPEN → return multiplier=1.0 from Redis
+
+[ ] 11.4 DLQ: every consumer on message failure after maxRetries publishes to
+         {TOPIC}.DLQ; admin-service replay endpoint for recovery
+
+[ ] 11.5 Backpressure: driver location updates: bounded async buffer (10k),
+         drop+metric on full; matching: semaphore 500 goroutines, else 503
+
+[ ] 11.6 Graceful shutdown: SIGTERM → drain 30s → flush Kafka → close pgxpool → exit
+
+[ ] 11.7 Health probes on every service:
+         GET /health/live  → 200 always (process alive)
+         GET /health/ready → 200 if DB+Redis+Kafka OK, else 503
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 12 — ERD (Dispatch/Matching LLD focus)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[ ] 12.1 Document in docs/erd.txt:
+
+  [users_db]                       [drivers_db]
+  users                            drivers
+  ──────────────────                ──────────────────────
+  id UUID PK                        id UUID PK
+  name, email(UNIQUE)               name, email(UNIQUE)
+  phone(UNIQUE), password_hash      phone(UNIQUE), password_hash
+  rating, rating_count              vehicle_type, license_plate
+  created_at                        status, rating, rating_count
+                                    created_at
+
+  [trips_db]
+  trips                             ratings
+  ──────────────────────────        ──────────────────────
+  id UUID PK                        trip_id (FK→trips)
+  rider_id, driver_id               rater_id, rater_role
+  pickup/drop lat/lng               ratee_id, ratee_role
+  fare, status                      score INT (1-5)
+  payment_method, vehicle_type      comment, created_at
+  duration_seconds
+  requested_at, started_at
+  completed_at, created_at
+
+  [payments_db]
+  payments
+  ──────────────────────────────────────
+  id UUID PK, trip_id(UNIQUE)
+  rider_id, driver_id
+  amount, status, payment_method
+  provider, provider_order_id
+  provider_payment_id, provider_signature
+  failure_reason, metadata JSONB
+  attempts_count, created_at, completed_at
+
+  [notifications_db]               [admin_db]
+  notifications                    feature_flags
+  ──────────────────                ──────────────────────
+  id UUID PK                        id UUID PK
+  user_id, type                     name(UNIQUE), enabled
+  title, body, read                 rollout_pct, regions[]
+  created_at                        description, updated_by
+                                    updated_at
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 13 — TECHNOLOGY STACK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  HTTP Router    : go-chi/chi v5
+  Kafka Client   : segmentio/kafka-go
+  Redis Client   : redis/go-redis v9
+  Postgres       : jackc/pgx v5 + pgxpool
+  WebSocket      : gorilla/websocket
+  JWT            : golang-jwt/jwt v5
+  Circuit Breaker: sony/gobreaker
+  Metrics        : prometheus/client_golang
+  Logging        : rs/zerolog
+  H3 Geo-cells   : uber/h3-go
+  UUID           : google/uuid
+  Bcrypt         : golang.org/x/crypto/bcrypt
+  Config         : env vars via shared/pkg/env
+  Migrations     : go:embed + pgx exec (Flyway-style naming, no extra tool)
+  API Gateway    : NGINX (rate-limit, WebSocket upgrade, header stripping)
+  Observability  : Prometheus scrape on /metrics each service + Grafana
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 14 — SPRINT ORDER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Sprint 1  [ ] Section 1  — Scaffold + all shared packages
+Sprint 2  [ ] Section 2  — user-service
+          [ ] Section 3  — driver-service
+Sprint 3  [ ] Section 4  — trip-service (LLD)
+          [ ] Section 5  — matching-service (LLD)
+Sprint 4  [ ] Section 6  — surge-pricing-service (new)
+          [ ] Section 7  — payment-service
+Sprint 5  [ ] Section 8  — notification-service
+          [ ] Section 9  — admin-service (new)
+Sprint 6  [ ] Section 10 — bonus: driver earnings dashboard
+          [ ] Section 11 — resilience hardening
+          [ ] Section 12 — ERD docs
+          [ ] NGINX + docker-compose final integration test
+
+
+================================================================================
+STATUS LEGEND:  [ ] TODO   [x] DONE   [-] IN PROGRESS   [!] BLOCKED
+================================================================================
